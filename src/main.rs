@@ -5,8 +5,8 @@ const WINDOW_INITIAL_HEIGHT: u32 = 720;
 use notify::Watcher;
 // === === === === === === === === === === === === === === === ===
 use wgpu::{
-    include_wgsl, util::DeviceExt, Buffer, Color, Device, Queue, RenderPipeline, ShaderModule,
-    Surface, SurfaceConfiguration,
+    include_wgsl, util::DeviceExt, BindGroup, BindGroupEntry, Buffer, Color, Device, Queue,
+    RenderPipeline, ShaderModule, ShaderStages, Surface, SurfaceConfiguration,
 };
 use winit::dpi::PhysicalSize;
 
@@ -33,8 +33,12 @@ struct Gpu {
     quad_vertex: Buffer,
     quad_indices: Buffer,
     pipeline: RenderPipeline,
+    bind_group: BindGroup,
 
     clear_color: Color,
+
+    mouse_pos_uni: Buffer,
+    window_dim_uni: Buffer,
 }
 
 impl Gpu {
@@ -55,13 +59,6 @@ impl Gpu {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor::default(), None)
             .await?;
-
-        device.on_uncaptured_error(Box::new(|e| match e {
-            wgpu::Error::Validation { description, .. } => {
-                log::error!("Validation Error: {description}")
-            }
-            _ => panic!("{}", e),
-        }));
 
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_config = SurfaceConfiguration {
@@ -85,9 +82,26 @@ impl Gpu {
             contents: bytemuck::cast_slice(&QUAD_INDICES),
             usage: wgpu::BufferUsages::INDEX,
         });
+        let mouse_pos_uni = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MOUSE_POS"),
+            contents: bytemuck::cast_slice(&[0.0, 0.0]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let window_dim_uni = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("WINDOW_DIMENSION"),
+            contents: bytemuck::cast_slice(&[surface_config.width, surface_config.height]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
 
         let fragment_shader = device.create_shader_module(include_wgsl!("../main.wgsl"));
-        let pipeline = Self::init_pipeline(&device, &surface_config, &fragment_shader);
+
+        let (pipeline, bind_group) = Self::init_pipeline(
+            &device,
+            &surface_config,
+            &fragment_shader,
+            &mouse_pos_uni,
+            &window_dim_uni,
+        );
 
         Ok(Self {
             device,
@@ -98,8 +112,12 @@ impl Gpu {
             quad_vertex,
             quad_indices,
             pipeline,
+            bind_group,
 
             clear_color: Color::BLACK,
+
+            mouse_pos_uni,
+            window_dim_uni,
         })
     }
 
@@ -119,49 +137,96 @@ impl Gpu {
         device: &Device,
         surface_config: &SurfaceConfiguration,
         fragment: &ShaderModule,
-    ) -> RenderPipeline {
+        mouse_uniform: &Buffer,
+        window_dim_uniform: &Buffer,
+    ) -> (RenderPipeline, BindGroup) {
         let shader = device.create_shader_module(include_wgsl!("./vertex.wgsl"));
+
+        let bind_group_layouts =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: None,
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        count: None,
+                        visibility: ShaderStages::VERTEX_FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        count: None,
+                        visibility: ShaderStages::VERTEX_FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                    },
+                ],
+            });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &bind_group_layouts,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: mouse_uniform.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: window_dim_uniform.as_entire_binding(),
+                },
+            ],
+        });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[],
+            bind_group_layouts: &[&bind_group_layouts],
             push_constant_ranges: &[],
         });
 
-        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: None,
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview: None,
-            primitive: wgpu::PrimitiveState {
-                conservative: false,
-                cull_mode: None,
-                front_face: wgpu::FrontFace::Ccw,
-                strip_index_format: None,
-                unclipped_depth: false,
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                polygon_mode: wgpu::PolygonMode::Fill,
-            },
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vs_main",
-                buffers: &[Self::quad_vertex_desc()],
-            },
-            fragment: Some(wgpu::FragmentState {
-                entry_point: "fs_main",
-                module: fragment,
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+        (
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: None,
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview: None,
+                primitive: wgpu::PrimitiveState {
+                    conservative: false,
+                    cull_mode: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    strip_index_format: None,
+                    unclipped_depth: false,
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                },
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    buffers: &[Self::quad_vertex_desc()],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    entry_point: "fs_main",
+                    module: fragment,
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_config.format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
             }),
-        })
+            bind_group,
+        )
     }
 
     pub fn reload_fragment_shader(&mut self, src: &str) {
@@ -172,7 +237,14 @@ impl Gpu {
                 source: wgpu::ShaderSource::Wgsl(src.into()),
             });
 
-        let pipeline = Self::init_pipeline(&self.device, &self.surface_config, &shader);
+        let (pipeline, bind_group) = Self::init_pipeline(
+            &self.device,
+            &self.surface_config,
+            &shader,
+            &self.mouse_pos_uni,
+            &self.window_dim_uni,
+        );
+        self.bind_group = bind_group;
         self.pipeline = pipeline;
     }
 
@@ -180,6 +252,19 @@ impl Gpu {
         self.surface_config.width = dimensions.width;
         self.surface_config.height = dimensions.height;
         self.surface.configure(&self.device, &self.surface_config);
+        self.queue.write_buffer(
+            &self.window_dim_uni,
+            0,
+            bytemuck::cast_slice(&[dimensions.width, dimensions.height]),
+        );
+    }
+
+    pub fn mouse_move(&mut self, position: &winit::dpi::PhysicalPosition<f64>) {
+        self.queue.write_buffer(
+            &self.mouse_pos_uni,
+            0,
+            bytemuck::cast_slice(&[position.x as f32, position.y as f32]),
+        );
     }
 
     pub fn render(&self) -> anyhow::Result<()> {
@@ -207,6 +292,7 @@ impl Gpu {
             });
 
             p.set_pipeline(&self.pipeline);
+            p.set_bind_group(0, &self.bind_group, &[]);
             p.set_vertex_buffer(0, self.quad_vertex.slice(..));
             p.set_index_buffer(self.quad_indices.slice(..), wgpu::IndexFormat::Uint32);
 
@@ -294,7 +380,9 @@ fn main() -> anyhow::Result<()> {
                 WindowEvent::ScaleFactorChanged {
                     new_inner_size: dimensions,
                     ..
-                } => gpu.resize_surface(dimensions), // resized
+                } => gpu.resize_surface(dimensions),
+
+                WindowEvent::CursorMoved { position, .. } => gpu.mouse_move(&position),
 
                 _event => (), // everything else
             },
